@@ -108,12 +108,12 @@ s2mel:
         style_condition: true
 
 gpt_checkpoint: gpt_light.pth
-w2v_stat: checkpoints/wav2vec2bert_stats.pt
+w2v_stat: ../checkpoints/wav2vec2bert_stats.pt
 s2mel_checkpoint: s2mel_light.pth
-emo_matrix: checkpoints/feat2.pt 
-spk_matrix: checkpoints/feat1.pt
+emo_matrix: ../checkpoints/feat2.pt 
+spk_matrix: ../checkpoints/feat1.pt
 emo_num: [3, 17, 2, 8, 4, 5, 10, 24]
-qwen_emo_path: checkpoints/qwen0.6bemo4-merge/ 
+qwen_emo_path: ../checkpoints/qwen0.6bemo4-merge/ 
 vocoder:
     type: "bigvgan"
     name: "nvidia/bigvgan_v2_22khz_80band_256x"
