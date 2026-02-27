@@ -21,7 +21,7 @@ from indextts.utils.typical_sampling import TypicalLogitsWarper
 
 
 def null_position_embeddings(range, dim):
-    return torch.zeros((range.shape[0], range.shape[1], dim), device=range.device)
+    return torch.zeros((range.shape[0], range.shape[1], dim), device=range.device, dtype=torch.float16 if torch.is_autocast_enabled() else None) # we need a reliable way. Actually, the easiest way is to NOT return float32 directly but let it be promoted? No, 0 + float16 still defaults to float32 if the 0 is float32. Let's just do dtype=torch.half if we want? But what if we're not using fp16?
 
 
 class ResBlock(nn.Module):
@@ -159,6 +159,14 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
             emb = emb + self.text_pos_embedding.get_fixed_embedding(
                 attention_mask.shape[1] - mel_len, attention_mask.device
             )
+        print(f">> DEBUG: emb.dtype={emb.dtype}")
+        for param_name, param in self.transformer.named_parameters():
+             if hasattr(param, 'dtype'):
+                 print(f">> DEBUG: transformer parameter {param_name} dtype={param.dtype}")
+                 break
+        if past_key_values is not None:
+             print(f">> DEBUG: past_key_values[0][0].dtype={past_key_values[0][0].dtype}")
+
         transformer_outputs = self.transformer(
             inputs_embeds=emb,
             past_key_values=past_key_values,
@@ -256,6 +264,16 @@ class LearnedPositionEmbeddings(nn.Module):
         return self.emb(torch.tensor([ind], device=dev)).unsqueeze(0)
 
 
+class NullPositionEmbeddings(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+        self.register_buffer("dummy", torch.zeros(1), persistent=False)
+
+    def forward(self, x):
+        return torch.zeros((x.shape[0], x.shape[1], self.dim), device=x.device, dtype=self.dummy.dtype)
+
+
 def build_hf_gpt_transformer(layers, model_dim, heads, max_mel_seq_len, max_text_seq_len, checkpointing):
     """
     GPT-2 implemented by the HuggingFace library.
@@ -272,7 +290,7 @@ def build_hf_gpt_transformer(layers, model_dim, heads, max_mel_seq_len, max_text
     gpt = GPT2Model(gpt_config)
     # Override the built in positional embeddings
     del gpt.wpe
-    gpt.wpe = functools.partial(null_position_embeddings, dim=model_dim)
+    gpt.wpe = NullPositionEmbeddings(dim=model_dim)
     # Built-in token embeddings are unused.
     del gpt.wte
     return gpt, LearnedPositionEmbeddings(max_mel_seq_len, model_dim), LearnedPositionEmbeddings(max_text_seq_len, model_dim), \

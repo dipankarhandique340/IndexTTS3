@@ -37,3 +37,5 @@ hf_cache/
 *trained_ckpts*
 prompts/
 *.whl
+*.pth
+*.pt

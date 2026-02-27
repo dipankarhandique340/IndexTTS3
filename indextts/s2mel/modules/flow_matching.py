@@ -49,8 +49,8 @@ class BASECFM(torch.nn.Module, ABC):
                 shape: (batch_size, 80, mel_timesteps)
         """
         B, T = mu.size(0), mu.size(1)
-        z = torch.randn([B, self.in_channels, T], device=mu.device) * temperature
-        t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device)
+        z = torch.randn([B, self.in_channels, T], device=mu.device, dtype=mu.dtype) * temperature
+        t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device, dtype=mu.dtype)
         # t_span = t_span + (-1) * (torch.cos(torch.pi / 2 * t_span) - 1 + t_span)
         return self.solve_euler(z, x_lens, prompt, mu, style, f0, t_span, inference_cfg_rate)
 
