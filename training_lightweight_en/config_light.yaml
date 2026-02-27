@@ -1,5 +1,5 @@
 dataset:
-    bpe_model: checkpoints/bpe.model
+    bpe_model: ../checkpoints/bpe.model
     sample_rate: 24000
     squeeze: false
     mel:
