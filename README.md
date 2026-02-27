@@ -9,6 +9,17 @@
   - Train/finetune the gpt model to learn to predict tokens for the language
     - trainers\train_gpt_v2.py and train.bat
 
+### ✨ New CPU/Low-VRAM Optimization & Lightweight Cloud Training ✨
+A robust suite of optimizations and training scripts have been added to this fork:
+1. **CPU/Low-VRAM Inference (`run_cpu.py` & `webui_cpu.py`)** 
+   - Dynamically manages Tensor devices to prevent OOM errors on limited hardware (e.g. 4GB GPUs). 
+   - Core networks (`GPT` / `S2Mel`) run aggressively on FP16 via the GPU, while auxiliary features (`BigVGAN`, `W2V-BERT`) are dynamically swapped to the CPU's RAM.
+   - Run the fast WebUI with `.venv/bin/python webui_cpu.py`
+
+2. **Lightweight English Translation Environment (`training_lightweight_en/`)**
+   - Contains a stripped-down `config_light.yaml` altering the core model dimensions (from 24 layers to 12 layers) making the weights substantially lighter (GPT drops to ~1.7GB).
+   - Contains a pre-configured `Train_Online.ipynb` notebook. Easily upload to Colab, Kaggle, or Runpod to train an English-exclusive model with massive speed increases.
+
 The code here works and Japanese was *mostly* correct shown here: https://www.youtube.com/watch?v=47V7lS-HUpo (this model was trained on 1100 hours of audio for about 1.5 epochs)
 
 The latest updates are done with a focus on training a multilingual model which shows promise, while mostly retaining the base model abilities to speak English and Chinese. Emotion finetuning has not been investigated yet and it seems that full finetuning does not mess up the base emotion capabilities of the model.
