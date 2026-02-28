@@ -248,7 +248,7 @@ class DiT(torch.nn.Module):
             t2 = self.t_embedder2(t)
             x = self.wavenet(x, x_mask, g=t2.unsqueeze(2)).transpose(1, 2) + self.res_projection(
                 x_res)  # long residual connection
-            x = self.final_layer(x, t1).transpose(1, 2)
+            x = self.final_layer(x, t2).transpose(1, 2)
             x = self.conv2(x)
         else:
             x = self.final_mlp(x_res)
