@@ -14,7 +14,7 @@ python trainers/train_s2mel_v2.py \
     --resume auto \
     --batch-size 32 \
     --grad-accumulation 2 \
-    --epochs 30 \
+    --epochs 20 \
     --learning-rate 5e-4 \
-    --val-interval 1000 \
+    --val-interval 500 \
     --amp
