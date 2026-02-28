@@ -4,7 +4,7 @@
 # Usage: ./training_lightweight_en/train_lightweight_s2mel.sh
 
 echo "Starting S2Mel lightweight training..."
-uv run python trainers/train_s2mel_v2.py \
+python trainers/train_s2mel_v2.py \
     --train-manifest path/to/your/english_train_data.jsonl \
     --val-manifest path/to/your/english_val_data.jsonl \
     --config training_lightweight_en/config_light.yaml \
