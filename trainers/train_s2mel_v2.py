@@ -36,7 +36,7 @@ from indextts.s2mel.modules.commons import MyModel, load_checkpoint2
 from indextts.s2mel.modules.audio import mel_spectrogram
 from indextts.utils.maskgct_utils import build_semantic_codec
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S", force=True)
 log = logging.getLogger(__name__)
 
 
@@ -130,22 +130,50 @@ class S2MelDataset(Dataset):
 
     def _resolve(self, base, p):
         if not p: return None
-        pa = Path(p)
-        if pa.is_absolute() and pa.exists(): return pa
-        r = base / p
-        return r if r.exists() else None
+        candidates = [
+            Path(p),
+            base / p,
+            _PROJECT_ROOT / p,
+            _PROJECT_ROOT.parent / p,
+            Path("/kaggle/working/IndexTTS3") / p,
+            Path("/kaggle/working") / p,
+        ]
+        for c in candidates:
+            if c.is_absolute() and c.exists(): return c
+            
+        # fallback search
+        import glob
+        matches = glob.glob(f"**/{Path(p).name}", recursive=True)
+        if matches: return Path(matches[0]).resolve()
+        
+        return None
 
     def _resolve_audio(self, base, audio_str):
         if not audio_str: return None
         p = Path(audio_str)
-        if p.is_absolute() and p.exists(): return p
-        r = base / audio_str
-        if r.exists(): return r
+        
+        candidates = [
+            p,
+            base / audio_str,
+            _PROJECT_ROOT / audio_str,
+            _PROJECT_ROOT.parent / audio_str,
+            Path("/kaggle/working/IndexTTS3") / audio_str,
+            Path("/kaggle/working") / audio_str,
+        ]
+        
         for root in self.audio_roots:
-            c = Path(root) / audio_str
-            if c.exists(): return c
-            c = Path(root) / p.name
-            if c.exists(): return c
+            candidates.append(Path(root) / audio_str)
+            candidates.append(Path(root) / p.name)
+            
+        for c in candidates:
+            if c.is_absolute() and c.exists(): return c
+            if (Path.cwd() / c).exists(): return (Path.cwd() / c).resolve()
+            
+        # fallback search by filename
+        import glob
+        matches = glob.glob(f"**/{p.name}", recursive=True)
+        if matches: return Path(matches[0]).resolve()
+            
         return None
 
     def __len__(self):
