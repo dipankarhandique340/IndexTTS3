@@ -562,9 +562,6 @@ def main():
         elapsed = time.time() - t0
         avg = ep_loss / max(ep_n, 1)
         log.info(f"[Epoch {epoch}/{args.epochs}] avg_loss={avg:.4f} time={elapsed:.0f}s")
-        if epoch % 8 == 0 or epoch == args.epochs:
-            save_ckpt(args.output_dir / f"model_epoch{epoch}.pth",
-                      model, optimizer, scheduler, scaler, epoch, global_step, recent)
         save_ckpt(args.output_dir / "latest.pth",
                   model, optimizer, scheduler, scaler, epoch, global_step, [])
 
