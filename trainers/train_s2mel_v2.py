@@ -5,8 +5,8 @@ End-to-end finetuning entry point for IndexTTS2 S2Mel (DiT flow-matching) module
 The S2Mel model converts semantic tokens into Mel spectrograms using a
 Conditional Flow Matching (CFM) approach with a DiT backbone.
 
-This trainer loads preprocessed data (audio + semantic codes + condition embeddings)
-and trains the DiT model to predict mel spectrograms from semantic representations.
+This trainer loads preprocessed data manifests that contain paths to
+pre-extracted features (semantic codes, conditioning embeddings, mel specs).
 """
 
 import argparse
@@ -15,15 +15,14 @@ import logging
 import os
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
-from torch.nn.utils.rnn import pad_sequence
 from transformers import get_cosine_schedule_with_warmup
 from omegaconf import OmegaConf
 
@@ -37,7 +36,6 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from indextts.s2mel.modules.flow_matching import CFM
 
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
@@ -46,41 +44,79 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
+# ========================================================================
+# Mel extraction from audio (used when mel .npy not pre-saved)
+# ========================================================================
+def extract_mel_from_audio(audio_path: str, cfg) -> Optional[torch.Tensor]:
+    """Extract mel spectrogram from an audio file.
+    
+    Returns:
+        mel tensor of shape (n_mels, T) or None on failure
+    """
+    try:
+        import torchaudio
+        import torchaudio.transforms as T
+    except ImportError:
+        return None
+
+    try:
+        waveform, sr = torchaudio.load(audio_path)
+        waveform = waveform[0]  # mono
+
+        pp = cfg.s2mel.preprocess_params
+        sp = pp.spect_params
+        target_sr = pp.sr
+
+        if sr != target_sr:
+            resampler = T.Resample(orig_freq=sr, new_freq=target_sr)
+            waveform = resampler(waveform)
+
+        mel_transform = T.MelSpectrogram(
+            sample_rate=target_sr,
+            n_fft=sp.n_fft,
+            hop_length=sp.hop_length,
+            win_length=sp.win_length,
+            n_mels=sp.n_mels,
+            f_min=sp.fmin,
+            f_max=None,
+            power=1.0,
+            norm="slaney",
+            mel_scale="slaney",
+        )
+
+        mel = mel_transform(waveform.unsqueeze(0))
+        mel = torch.log(torch.clamp(mel, min=1e-5))
+        return mel.squeeze(0)  # (n_mels, T)
+    except Exception as e:
+        log.warning(f"  Failed to extract mel from {audio_path}: {e}")
+        return None
+
+
+# ========================================================================
+# CLI
+# ========================================================================
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Finetune IndexTTS2 S2Mel (DiT) model.")
-    parser.add_argument(
-        "--train-manifest",
-        dest="train_manifests",
-        action="append",
-        type=str,
-        required=True,
-        help="Training manifest JSONL.",
-    )
-    parser.add_argument(
-        "--val-manifest",
-        dest="val_manifests",
-        action="append",
-        type=str,
-        required=True,
-        help="Validation manifest JSONL.",
-    )
-    parser.add_argument("--config", type=Path, default=Path("checkpoints/config.yaml"), help="Model config YAML.")
-    parser.add_argument("--base-checkpoint", type=Path, default=Path("checkpoints/s2mel.pth"), help="Base S2Mel checkpoint.")
-    parser.add_argument("--output-dir", type=Path, default=Path("trained_ckpts_s2mel"), help="Directory for checkpoints/logs.")
-    parser.add_argument("--batch-size", type=int, default=8, help="Mini-batch size.")
-    parser.add_argument("--grad-accumulation", type=int, default=1, help="Gradient accumulation steps.")
-    parser.add_argument("--epochs", type=int, default=30, help="Number of epochs.")
-    parser.add_argument("--learning-rate", type=float, default=1e-4, help="Initial learning rate.")
-    parser.add_argument("--weight-decay", type=float, default=0.01, help="Weight decay.")
-    parser.add_argument("--warmup-steps", type=int, default=500, help="LR warmup steps.")
-    parser.add_argument("--max-steps", type=int, default=0, help="Optional max optimiser steps (0 = unlimited).")
-    parser.add_argument("--log-interval", type=int, default=5, help="Steps between training log entries.")
-    parser.add_argument("--val-interval", type=int, default=0, help="Validation frequency in steps (0 = once per epoch).")
-    parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers.")
-    parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient norm clipping value.")
-    parser.add_argument("--amp", action="store_true", help="Enable CUDA AMP.")
-    parser.add_argument("--resume", type=str, default="", help="Path to checkpoint to resume from, or 'auto'.")
-    parser.add_argument("--seed", type=int, default=1234, help="Random seed.")
+    parser.add_argument("--train-manifest", dest="train_manifests", action="append", type=str, required=True)
+    parser.add_argument("--val-manifest", dest="val_manifests", action="append", type=str, required=True)
+    parser.add_argument("--config", type=Path, default=Path("checkpoints/config.yaml"))
+    parser.add_argument("--base-checkpoint", type=Path, default=Path("checkpoints/s2mel.pth"))
+    parser.add_argument("--output-dir", type=Path, default=Path("trained_ckpts_s2mel"))
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--grad-accumulation", type=int, default=1)
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--warmup-steps", type=int, default=500)
+    parser.add_argument("--max-steps", type=int, default=0)
+    parser.add_argument("--log-interval", type=int, default=5)
+    parser.add_argument("--val-interval", type=int, default=0)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--amp", action="store_true")
+    parser.add_argument("--resume", type=str, default="")
+    parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--audio-root", type=str, default="", help="Root directory for audio files if paths are relative")
     return parser.parse_args()
 
 
@@ -94,188 +130,172 @@ def set_seed(seed: int):
 
 
 # ========================================================================
-# Mel extraction utility
+# Dataset  
 # ========================================================================
-class MelExtractor:
-    """Extract mel spectrograms from audio waveforms."""
-
-    def __init__(self, cfg):
-        pp = cfg.s2mel.preprocess_params
-        sp = pp.spect_params
-        self.sr = pp.sr
-        self.n_fft = sp.n_fft
-        self.hop_length = sp.hop_length
-        self.win_length = sp.win_length
-        self.n_mels = sp.n_mels
-        self.fmin = sp.fmin
-        fmax = sp.get("fmax", None)
-        self.fmax = None if fmax == "None" or fmax is None else float(fmax)
-
-    def extract(self, waveform: torch.Tensor, sr: int) -> torch.Tensor:
-        """Extract mel spectrogram from waveform tensor.
-        
-        Args:
-            waveform: (num_samples,) audio tensor
-            sr: sample rate
-            
-        Returns:
-            mel: (n_mels, T) mel spectrogram
-        """
-        import torchaudio
-        import torchaudio.transforms as T
-
-        # Resample if needed
-        if sr != self.sr:
-            resampler = T.Resample(orig_freq=sr, new_freq=self.sr)
-            waveform = resampler(waveform)
-
-        # Compute mel spectrogram
-        mel_transform = T.MelSpectrogram(
-            sample_rate=self.sr,
-            n_fft=self.n_fft,
-            hop_length=self.hop_length,
-            win_length=self.win_length,
-            n_mels=self.n_mels,
-            f_min=self.fmin,
-            f_max=self.fmax,
-            power=1.0,
-            norm="slaney",
-            mel_scale="slaney",
-        )
-
-        if waveform.dim() == 1:
-            waveform = waveform.unsqueeze(0)
-
-        mel = mel_transform(waveform)
-        mel = torch.log(torch.clamp(mel, min=1e-5))
-        return mel.squeeze(0)  # (n_mels, T)
-
-
-# ========================================================================
-# Dataset
-# ========================================================================
-@dataclass
-class S2MelSample:
-    id: str
-    audio_path: str
-    codes_path: Path
-    condition_path: Path
-    emo_vec_path: Path
-    code_len: int
-    condition_len: int
-    manifest_path: Optional[Path] = None
-
-
 class S2MelDataset(Dataset):
     """Dataset for S2Mel training.
     
-    Each sample consists of:
-    - mel spectrogram (extracted on-the-fly from audio)
-    - semantic codes (loaded from preprocessed .npy)
-    - conditioning embedding (loaded from preprocessed .npy)
-    - emo vector (loaded from preprocessed .npy)
+    Loads pre-computed features from the preprocessing pipeline:
+    - semantic codes (.npy) - used for conditioning input (mu)
+    - conditioning embeddings (.npy) - w2v-bert style features
+    - mel spectrograms - extracted from audio on-the-fly
     """
 
-    def __init__(self, manifest_paths: Sequence[str], mel_extractor: MelExtractor):
-        self.samples: List[S2MelSample] = []
-        self.mel_extractor = mel_extractor
+    def __init__(self, manifest_paths: Sequence[str], cfg, audio_roots: Optional[List[str]] = None):
+        self.samples = []
+        self.cfg = cfg
+        self.audio_roots = audio_roots or []
 
         for mp in manifest_paths:
             mp = Path(mp)
             base_dir = mp.parent
             log.info(f"[Info] Parsing manifest {mp} ...")
             count = 0
+            skipped = 0
             with open(mp, "r", encoding="utf-8") as f:
-                for line in f:
+                for line_num, line in enumerate(f):
                     line = line.strip()
                     if not line:
                         continue
-                    record = json.loads(line)
-
-                    # Resolve paths relative to manifest
-                    codes_path = base_dir / record["codes_path"] if not Path(record["codes_path"]).is_absolute() else Path(record["codes_path"])
-                    condition_path = base_dir / record["condition_path"] if not Path(record["condition_path"]).is_absolute() else Path(record["condition_path"])
-                    emo_vec_path = base_dir / record["emo_vec_path"] if not Path(record["emo_vec_path"]).is_absolute() else Path(record["emo_vec_path"])
-
-                    # Resolve audio path
-                    audio_path = record.get("audio_path", "")
-                    if audio_path and not Path(audio_path).is_absolute():
-                        audio_path = str(base_dir / audio_path)
-
-                    if not Path(audio_path).exists():
-                        continue
-                    if not codes_path.exists():
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        skipped += 1
                         continue
 
-                    self.samples.append(S2MelSample(
-                        id=record["id"],
-                        audio_path=audio_path,
-                        codes_path=codes_path,
-                        condition_path=condition_path,
-                        emo_vec_path=emo_vec_path,
-                        code_len=record.get("code_len", 0),
-                        condition_len=record.get("condition_len", 0),
-                        manifest_path=mp,
-                    ))
+                    # Resolve feature paths relative to manifest dir
+                    codes_path = self._resolve_path(base_dir, record.get("codes_path", ""))
+                    condition_path = self._resolve_path(base_dir, record.get("condition_path", ""))
+                    emo_vec_path = self._resolve_path(base_dir, record.get("emo_vec_path", ""))
+
+                    # Check required features exist
+                    if not codes_path or not codes_path.exists():
+                        skipped += 1
+                        continue
+                    if not condition_path or not condition_path.exists():
+                        skipped += 1
+                        continue
+
+                    # Resolve audio path (try multiple roots)
+                    audio_path = self._resolve_audio(base_dir, record.get("audio_path", ""))
+
+                    # Check mel path (pre-computed)
+                    mel_path = self._resolve_path(base_dir, record.get("mel_path", ""))
+
+                    if not audio_path and not (mel_path and mel_path.exists()):
+                        skipped += 1
+                        continue
+
+                    self.samples.append({
+                        "id": record.get("id", f"sample_{line_num}"),
+                        "audio_path": str(audio_path) if audio_path else None,
+                        "mel_path": str(mel_path) if mel_path and mel_path.exists() else None,
+                        "codes_path": str(codes_path),
+                        "condition_path": str(condition_path),
+                        "emo_vec_path": str(emo_vec_path) if emo_vec_path and emo_vec_path.exists() else None,
+                        "code_len": record.get("code_len", 0),
+                        "condition_len": record.get("condition_len", 0),
+                    })
                     count += 1
 
-            log.info(f"    Loaded {count} samples from {mp.name}")
+            log.info(f"  Loaded {count} samples (skipped {skipped}) from {mp.name}")
         log.info(f"[Info] Total S2Mel training samples: {len(self.samples)}")
+
+    def _resolve_path(self, base_dir: Path, path_str: str) -> Optional[Path]:
+        if not path_str:
+            return None
+        p = Path(path_str)
+        if p.is_absolute() and p.exists():
+            return p
+        resolved = base_dir / path_str
+        if resolved.exists():
+            return resolved
+        return None
+
+    def _resolve_audio(self, base_dir: Path, audio_str: str) -> Optional[Path]:
+        if not audio_str:
+            return None
+        # Try absolute
+        p = Path(audio_str)
+        if p.is_absolute() and p.exists():
+            return p
+        # Try relative to manifest dir
+        resolved = base_dir / audio_str
+        if resolved.exists():
+            return resolved
+        # Try each audio root
+        for root in self.audio_roots:
+            candidate = Path(root) / audio_str
+            if candidate.exists():
+                return candidate
+            # Try just the filename
+            candidate = Path(root) / Path(audio_str).name
+            if candidate.exists():
+                return candidate
+        return None
 
     def __len__(self):
         return len(self.samples)
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Optional[Dict[str, torch.Tensor]]:
         sample = self.samples[idx]
 
         # Load semantic codes
-        codes = np.load(sample.codes_path)
-        codes = torch.from_numpy(codes).long().squeeze()  # (code_len,)
+        codes = np.load(sample["codes_path"])
+        codes = torch.from_numpy(codes).long().squeeze()
 
-        # Load condition embedding
-        cond = np.load(sample.condition_path)
+        # Load condition embedding (w2v-bert features)
+        cond = np.load(sample["condition_path"])
         cond = torch.from_numpy(cond).float()  # (cond_len, dim)
 
-        # Load emo vector
-        emo = np.load(sample.emo_vec_path)
-        emo = torch.from_numpy(emo).float().squeeze()  # (emo_dim,)
+        # Load emo vector if available
+        if sample["emo_vec_path"]:
+            emo = np.load(sample["emo_vec_path"])
+            emo = torch.from_numpy(emo).float().squeeze()
+        else:
+            emo = torch.zeros(192)  # default style dim
 
-        # Load audio and extract mel
-        import torchaudio
-        waveform, sr = torchaudio.load(sample.audio_path)
-        waveform = waveform[0]  # mono
-        mel = self.mel_extractor.extract(waveform, sr)  # (n_mels, T)
+        # Load mel - prefer pre-computed, else extract from audio
+        mel = None
+        if sample["mel_path"]:
+            mel_np = np.load(sample["mel_path"])
+            mel = torch.from_numpy(mel_np).float()
+        elif sample["audio_path"]:
+            mel = extract_mel_from_audio(sample["audio_path"], self.cfg)
 
-        # We need to match mel length with code length
-        # The semantic codes have a different temporal resolution than mel
-        # We'll handle alignment in the collate function
+        if mel is None:
+            # Return a dummy that will be filtered in collate
+            return None
+
+        # Ensure mel is (n_mels, T)
+        if mel.dim() == 3:
+            mel = mel.squeeze(0)
 
         return {
-            "mel": mel,           # (n_mels, T)
-            "codes": codes,       # (code_len,)
-            "condition": cond,    # (cond_len, dim)
-            "emo": emo,           # (emo_dim,)
-            "id": sample.id,
+            "mel": mel,
+            "codes": codes,
+            "condition": cond,
+            "emo": emo,
         }
 
 
-def collate_s2mel(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-    """Collate function for S2Mel batches."""
+def collate_s2mel(batch):
+    """Collate function that filters None samples."""
+    batch = [b for b in batch if b is not None]
+    if not batch:
+        return None
+
     mels = [item["mel"] for item in batch]
     codes_list = [item["codes"] for item in batch]
     conditions = [item["condition"] for item in batch]
     emos = [item["emo"] for item in batch]
 
-    # Get max lengths
     max_mel_len = max(m.size(-1) for m in mels)
-    max_code_len = max(c.size(0) for c in codes_list)
     max_cond_len = max(c.size(0) for c in conditions)
     n_mels = mels[0].size(0)
     cond_dim = conditions[0].size(-1)
-
     B = len(batch)
 
-    # Pad mels: (B, n_mels, T)
     mel_padded = torch.zeros(B, n_mels, max_mel_len)
     mel_lens = torch.zeros(B, dtype=torch.long)
     for i, m in enumerate(mels):
@@ -283,15 +303,6 @@ def collate_s2mel(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tenso
         mel_padded[i, :, :T] = m
         mel_lens[i] = T
 
-    # Pad codes: (B, max_code_len)
-    codes_padded = torch.zeros(B, max_code_len, dtype=torch.long)
-    code_lens = torch.zeros(B, dtype=torch.long)
-    for i, c in enumerate(codes_list):
-        L = c.size(0)
-        codes_padded[i, :L] = c
-        code_lens[i] = L
-
-    # Pad conditions: (B, max_cond_len, dim)
     cond_padded = torch.zeros(B, max_cond_len, cond_dim)
     cond_lens = torch.zeros(B, dtype=torch.long)
     for i, c in enumerate(conditions):
@@ -299,14 +310,11 @@ def collate_s2mel(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tenso
         cond_padded[i, :L, :] = c
         cond_lens[i] = L
 
-    # Stack emos: (B, emo_dim)
     emo_stacked = torch.stack(emos, dim=0)
 
     return {
         "mel": mel_padded,
         "mel_lens": mel_lens,
-        "codes": codes_padded,
-        "code_lens": code_lens,
         "condition": cond_padded,
         "cond_lens": cond_lens,
         "emo": emo_stacked,
@@ -314,24 +322,21 @@ def collate_s2mel(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tenso
 
 
 # ========================================================================
-# Model building
+# Model
 # ========================================================================
 def build_s2mel_model(cfg_path: Path, base_checkpoint: Path, device: torch.device) -> CFM:
-    """Build and load the S2Mel CFM model."""
     cfg = OmegaConf.load(cfg_path)
     model = CFM(cfg.s2mel)
-    
+
     if base_checkpoint.exists():
         log.info(f"[Info] Loading base S2Mel checkpoint from {base_checkpoint}")
         state_dict = torch.load(base_checkpoint, map_location="cpu", weights_only=True)
-        
-        # Handle different checkpoint formats
+
         if "model" in state_dict:
             state_dict = state_dict["model"]
         elif "state_dict" in state_dict:
             state_dict = state_dict["state_dict"]
-        
-        # Remove prefix if present
+
         cleaned = {}
         for k, v in state_dict.items():
             if k.startswith("s2mel."):
@@ -340,56 +345,46 @@ def build_s2mel_model(cfg_path: Path, base_checkpoint: Path, device: torch.devic
                 cleaned[k[7:]] = v
             else:
                 cleaned[k] = v
-        
+
         missing, unexpected = model.load_state_dict(cleaned, strict=False)
         if missing:
-            log.warning(f"  Missing keys: {len(missing)}")
+            log.warning(f"  Missing keys: {len(missing)} - {missing[:5]}")
         if unexpected:
-            log.warning(f"  Unexpected keys: {len(unexpected)}")
-        log.info(f"[Info] S2Mel model loaded successfully.")
+            log.warning(f"  Unexpected keys: {len(unexpected)} - {unexpected[:5]}")
+        log.info("[Info] S2Mel model loaded successfully.")
     else:
-        log.warning(f"[Warning] No base checkpoint found at {base_checkpoint}, training from scratch.")
+        log.warning(f"[Warning] No base checkpoint at {base_checkpoint}, training from scratch.")
 
     return model.to(device)
 
 
 # ========================================================================
-# Training utilities
+# Training
 # ========================================================================
-def compute_s2mel_loss(
-    model: CFM,
-    batch: Dict[str, torch.Tensor],
-    device: torch.device,
-) -> torch.Tensor:
-    """Compute the CFM flow matching loss."""
-    mel = batch["mel"].to(device)          # (B, n_mels, T)
-    mel_lens = batch["mel_lens"].to(device)  # (B,)
-    condition = batch["condition"].to(device)  # (B, cond_len, dim)
-    emo = batch["emo"].to(device)  # (B, emo_dim)
+def compute_s2mel_loss(model, batch, device, style_dim=192):
+    mel = batch["mel"].to(device)
+    mel_lens = batch["mel_lens"].to(device)
+    condition = batch["condition"].to(device)
+    cond_lens = batch["cond_lens"]
+    emo = batch["emo"].to(device)
 
-    # Use a portion of the mel as prompt (e.g., first 20%)
     B = mel.size(0)
-    prompt_lens = (mel_lens.float() * 0.2).long().clamp(min=10)
-
-    # Condition (semantic features) needs to be transposed for the model: (B, T, dim) -> (B, dim, T)
-    # The model expects mu as (B, T, dim) format based on flow_matching.py forward
-    # Pad/truncate condition to match mel length
     max_mel_len = mel.size(-1)
     cond_dim = condition.size(-1)
+
+    # Prompt = first ~20% of mel as reference
+    prompt_lens = (mel_lens.float() * 0.2).long().clamp(min=10)
+
+    # Build mu: pad/truncate condition to match mel time dimension
+    # condition is (B, cond_T, dim), need (B, mel_T, dim)
     mu = torch.zeros(B, max_mel_len, cond_dim, device=device)
     for i in range(B):
-        cond_len = min(batch["cond_lens"][i].item(), max_mel_len)
-        mu[i, :cond_len, :] = condition[i, :cond_len, :]
+        clen = min(cond_lens[i].item(), max_mel_len)
+        mu[i, :clen, :] = condition[i, :clen, :]
 
-    # Style from emo vector - adapt to expected dim
-    style_dim = 192  # From config_light.yaml style_encoder.dim
+    # Style vector
     if emo.size(-1) != style_dim:
-        # Simple projection or truncation
-        if emo.size(-1) > style_dim:
-            style = emo[:, :style_dim]
-        else:
-            style = torch.zeros(B, style_dim, device=device)
-            style[:, :emo.size(-1)] = emo
+        style = emo[:, :style_dim] if emo.size(-1) > style_dim else torch.zeros(B, style_dim, device=device)
     else:
         style = emo
 
@@ -397,16 +392,7 @@ def compute_s2mel_loss(
     return loss
 
 
-def save_checkpoint(
-    path: Path,
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scheduler,
-    scaler,
-    epoch: int,
-    step: int,
-    recent_checkpoints: List[str],
-):
+def save_checkpoint(path, model, optimizer, scheduler, scaler, epoch, step, recent_checkpoints):
     state = {
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
@@ -418,39 +404,35 @@ def save_checkpoint(
     torch.save(state, path)
     log.info(f"  Saved checkpoint: {path}")
 
-    # Keep maximum 3 recent checkpoints
     recent_checkpoints.append(str(path))
     while len(recent_checkpoints) > 3:
         old = recent_checkpoints.pop(0)
         old_path = Path(old)
         if old_path.exists() and "latest" not in old_path.name:
             old_path.unlink()
-            log.info(f"  Removed old checkpoint: {old}")
 
 
-def evaluate(
-    model: CFM,
-    loader: DataLoader,
-    device: torch.device,
-) -> float:
+def evaluate(model, loader, device, style_dim=192):
     model.eval()
     total_loss = 0.0
-    n_batches = 0
+    n = 0
     with torch.no_grad():
         for batch in loader:
+            if batch is None:
+                continue
             try:
-                loss = compute_s2mel_loss(model, batch, device)
+                loss = compute_s2mel_loss(model, batch, device, style_dim)
                 total_loss += loss.item()
-                n_batches += 1
+                n += 1
             except Exception as e:
-                log.warning(f"  Validation batch error: {e}")
+                log.warning(f"  Val batch error: {e}")
                 continue
     model.train()
-    return total_loss / max(n_batches, 1)
+    return total_loss / max(n, 1)
 
 
 # ========================================================================
-# Main training loop
+# Main
 # ========================================================================
 def main():
     args = parse_args()
@@ -459,66 +441,57 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info(f"[Info] Device: {device}")
 
-    # Load config
     cfg = OmegaConf.load(args.config)
 
-    # Build mel extractor
-    mel_extractor = MelExtractor(cfg)
+    # Determine style dim from config
+    style_dim = cfg.s2mel.get("style_encoder", {}).get("dim", 192)
 
-    # Build datasets
+    # Audio roots for resolving audio paths
+    audio_roots = []
+    if args.audio_root:
+        audio_roots.append(args.audio_root)
+    # Common locations
+    audio_roots.extend(["datasets/LJSpeech-1.1/wavs", "datasets/LJSpeech-1.1", "datasets"])
+
     log.info("[Info] Loading training manifests...")
-    train_dataset = S2MelDataset(args.train_manifests, mel_extractor)
+    train_dataset = S2MelDataset(args.train_manifests, cfg, audio_roots)
     log.info("[Info] Loading validation manifests...")
-    val_dataset = S2MelDataset(args.val_manifests, mel_extractor)
+    val_dataset = S2MelDataset(args.val_manifests, cfg, audio_roots)
+
+    if len(train_dataset) == 0:
+        log.error("[Error] No training samples loaded! Check that audio files exist.")
+        log.error("  Audio roots searched: " + str(audio_roots))
+        log.error("  Try downloading LJSpeech first:")
+        log.error("    wget https://data.keithito.com/data/speech/LJSpeech-1.1.tar.bz2")
+        log.error("    tar -xf LJSpeech-1.1.tar.bz2 -C datasets/")
+        sys.exit(1)
 
     train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        collate_fn=collate_s2mel,
-        pin_memory=True,
-        drop_last=True,
+        train_dataset, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, collate_fn=collate_s2mel,
+        pin_memory=True, drop_last=True,
     )
     val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        collate_fn=collate_s2mel,
+        val_dataset, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, collate_fn=collate_s2mel,
         pin_memory=True,
     )
 
-    # Build model
     log.info("[Info] Building S2Mel model...")
     model = build_s2mel_model(args.config, args.base_checkpoint, device)
-    
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log.info(f"[Info] Trainable parameters: {n_params:,}")
 
-    # Optimizer
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.learning_rate,
-        weight_decay=args.weight_decay,
-    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
 
-    # Scheduler
     total_steps = len(train_loader) * args.epochs // args.grad_accumulation
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=args.warmup_steps,
-        num_training_steps=total_steps,
-    )
+    scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=total_steps)
 
-    # AMP scaler
     scaler = torch.amp.GradScaler("cuda") if args.amp else None
 
-    # Output directory
     args.output_dir.mkdir(parents=True, exist_ok=True)
     (args.output_dir / "logs").mkdir(exist_ok=True)
 
-    # Resume
     start_epoch = 1
     global_step = 0
     recent_checkpoints: List[str] = []
@@ -544,12 +517,8 @@ def main():
             start_epoch = ckpt.get("epoch", 0) + 1
             global_step = ckpt.get("step", 0)
             log.info(f"  Resumed at epoch {start_epoch}, step {global_step}")
-        else:
-            log.info("[Info] No checkpoint found for resume, starting fresh.")
 
-    # Training loop
     log.info(f"[Info] Starting training: {args.epochs} epochs, {len(train_loader)} batches/epoch")
-    log.info(f"[Info] Effective batch size: {args.batch_size * args.grad_accumulation}")
 
     model.train()
     for epoch in range(start_epoch, args.epochs + 1):
@@ -558,10 +527,12 @@ def main():
         t0 = time.time()
 
         for batch_idx, batch in enumerate(train_loader):
+            if batch is None:
+                continue
             try:
                 use_amp = args.amp and device.type == "cuda"
                 with torch.amp.autocast("cuda", enabled=use_amp):
-                    loss = compute_s2mel_loss(model, batch, device)
+                    loss = compute_s2mel_loss(model, batch, device, style_dim)
                     loss = loss / args.grad_accumulation
 
                 if scaler:
@@ -587,32 +558,18 @@ def main():
                     epoch_loss += actual_loss
                     epoch_batches += 1
 
-                    # Log
                     if global_step % args.log_interval == 0 or global_step == 1:
                         lr = optimizer.param_groups[0]["lr"]
-                        log.info(
-                            f"[Train] epoch={epoch} step={global_step} "
-                            f"loss={actual_loss:.4f} "
-                            f"lr={lr:.2e}"
-                        )
+                        log.info(f"[Train] epoch={epoch} step={global_step} loss={actual_loss:.4f} lr={lr:.2e}")
 
-                    # Validation
                     if args.val_interval > 0 and global_step % args.val_interval == 0:
-                        val_loss = evaluate(model, val_loader, device)
-                        log.info(
-                            f"[Val] epoch={epoch} step={global_step} "
-                            f"loss={val_loss:.4f}"
-                        )
-
-                    # Save checkpoint
-                    if args.val_interval > 0 and global_step % args.val_interval == 0:
+                        val_loss = evaluate(model, val_loader, device, style_dim)
+                        log.info(f"[Val] epoch={epoch} step={global_step} loss={val_loss:.4f}")
                         ckpt_path = args.output_dir / f"model_step{global_step}.pth"
                         save_checkpoint(ckpt_path, model, optimizer, scheduler, scaler, epoch, global_step, recent_checkpoints)
-                        # Always save latest
                         latest_path = args.output_dir / "latest.pth"
                         save_checkpoint(latest_path, model, optimizer, scheduler, scaler, epoch, global_step, [])
 
-                    # Max steps
                     if args.max_steps > 0 and global_step >= args.max_steps:
                         log.info(f"[Info] Reached max steps {args.max_steps}")
                         break
@@ -625,23 +582,17 @@ def main():
                     continue
                 raise
 
-        # End of epoch
         elapsed = time.time() - t0
         avg_loss = epoch_loss / max(epoch_batches, 1)
-        log.info(
-            f"[Epoch {epoch}/{args.epochs}] avg_loss={avg_loss:.4f} "
-            f"time={elapsed:.0f}s"
-        )
+        log.info(f"[Epoch {epoch}/{args.epochs}] avg_loss={avg_loss:.4f} time={elapsed:.0f}s")
 
-        # Save epoch checkpoint
         ckpt_path = args.output_dir / f"model_epoch{epoch}.pth"
         save_checkpoint(ckpt_path, model, optimizer, scheduler, scaler, epoch, global_step, recent_checkpoints)
         latest_path = args.output_dir / "latest.pth"
         save_checkpoint(latest_path, model, optimizer, scheduler, scaler, epoch, global_step, [])
 
-        # Epoch validation
-        if val_loader and len(val_dataset) > 0:
-            val_loss = evaluate(model, val_loader, device)
+        if len(val_dataset) > 0:
+            val_loss = evaluate(model, val_loader, device, style_dim)
             log.info(f"[Val] epoch={epoch} loss={val_loss:.4f}")
 
     log.info("Training complete.")
