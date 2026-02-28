@@ -221,8 +221,47 @@ def build_model(cfg_path, base_checkpoint, device):
 
     if base_checkpoint.exists():
         log.info(f"[Info] Loading checkpoint from {base_checkpoint}")
-        model, _, _, _ = load_checkpoint2(model, None, base_checkpoint, is_distributed=False)
-        log.info("[Info] S2Mel model loaded.")
+        state = torch.load(base_checkpoint, map_location="cpu", weights_only=False)
+
+        if isinstance(state, dict) and "net" in state:
+            # Standard format: use load_checkpoint2
+            model, _, _, _ = load_checkpoint2(model, None, base_checkpoint, is_distributed=False)
+            log.info("[Info] S2Mel loaded via load_checkpoint2.")
+        else:
+            # Raw state_dict (init checkpoint) - manual loading
+            if not isinstance(state, dict):
+                log.warning("[Warning] Unexpected checkpoint format")
+            else:
+                raw = state
+                # Try to match keys to model sub-modules
+                for module_name in ['cfm', 'length_regulator']:
+                    if module_name not in model.models:
+                        continue
+                    module_state = {}
+                    prefixes = [
+                        f"models.{module_name}.",
+                        f"models.cfm.{module_name}." if module_name != 'cfm' else "models.cfm.",
+                        f"{module_name}.",
+                    ]
+                    for k, v in raw.items():
+                        for prefix in prefixes:
+                            if k.startswith(prefix):
+                                clean_k = k[len(prefix):]
+                                module_state[clean_k] = v
+                                break
+
+                    if module_state:
+                        model_sd = model.models[module_name].state_dict()
+                        filtered = {k: v for k, v in module_state.items()
+                                    if k in model_sd and v.shape == model_sd[k].shape}
+                        skipped = set(module_state.keys()) - set(filtered.keys())
+                        if skipped:
+                            log.warning(f"  {module_name}: skipped {len(skipped)} keys (shape mismatch)")
+                        model.models[module_name].load_state_dict(filtered, strict=False)
+                        log.info(f"  {module_name}: loaded {len(filtered)} params")
+                    else:
+                        log.warning(f"  {module_name}: no matching keys found in checkpoint")
+            log.info("[Info] S2Mel model loaded.")
     else:
         log.warning(f"[Warning] No checkpoint at {base_checkpoint}")
 
@@ -232,18 +271,21 @@ def build_model(cfg_path, base_checkpoint, device):
 
     # Try loading campplus weights from base checkpoint
     if base_checkpoint.exists():
-        state = torch.load(base_checkpoint, map_location="cpu", weights_only=True)
+        state = torch.load(base_checkpoint, map_location="cpu", weights_only=False)
         if isinstance(state, dict):
+            # Check in "net" format or raw
+            src = state.get("net", state)
             cp_state = {}
-            for k, v in state.items():
-                if "campplus" in k or "style_encoder" in k:
-                    clean_k = k.split("campplus.")[-1] if "campplus." in k else k
-                    cp_state[clean_k] = v
+            if isinstance(src, dict):
+                for k, v in src.items():
+                    if isinstance(v, torch.Tensor) and ("campplus" in k or "style_encoder" in k):
+                        clean_k = k.split("campplus.")[-1] if "campplus." in k else k
+                        cp_state[clean_k] = v
             if cp_state:
                 try:
                     campplus.load_state_dict(cp_state, strict=False)
                     log.info("[Info] CAMPPlus weights loaded from checkpoint")
-                except:
+                except Exception:
                     log.warning("[Warning] Could not load CAMPPlus weights, using random init")
 
     return model.to(device), campplus.to(device), cfg
