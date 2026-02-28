@@ -82,8 +82,22 @@ class S2MelDataset(Dataset):
         self.mel_cfg = mel_cfg
         self.audio_roots = audio_roots or []
 
-        for mp in manifest_paths:
-            mp = Path(mp)
+        def find_path(p: str) -> Path:
+            p_obj = Path(p)
+            if p_obj.is_absolute() and p_obj.exists(): return p_obj
+            candidates = [
+                p_obj,
+                Path("..") / p_obj,
+                Path("/kaggle/working/IndexTTS3") / p_obj,
+                _PROJECT_ROOT / p_obj,
+                _PROJECT_ROOT.parent / p_obj,
+            ]
+            for c in candidates:
+                if c.exists(): return c
+            return p_obj
+
+        for mp_str in manifest_paths:
+            mp = find_path(mp_str)
             base_dir = mp.parent
             log.info(f"[Info] Parsing manifest {mp} ...")
             count = skipped = 0
@@ -381,6 +395,22 @@ def main():
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info(f"[Info] Device: {device}")
+
+    def find_path(p: Path) -> Path:
+        if p.is_absolute() and p.exists(): return p
+        candidates = [
+            p,
+            Path("..") / p,
+            Path("/kaggle/working/IndexTTS3") / p,
+            _PROJECT_ROOT / p,
+            _PROJECT_ROOT.parent / p,
+        ]
+        for c in candidates:
+            if c.exists(): return c
+        return p
+
+    args.config = find_path(args.config)
+    args.base_checkpoint = find_path(args.base_checkpoint)
 
     cfg = OmegaConf.load(args.config)
 
