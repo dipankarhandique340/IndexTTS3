@@ -140,12 +140,7 @@ class S2MelDataset(Dataset):
         ]
         for c in candidates:
             if c.is_absolute() and c.exists(): return c
-            
-        # fallback search
-        import glob
-        matches = glob.glob(f"**/{Path(p).name}", recursive=True)
-        if matches: return Path(matches[0]).resolve()
-        
+            if c.exists(): return c.resolve()
         return None
 
     def _resolve_audio(self, base, audio_str):
@@ -167,13 +162,7 @@ class S2MelDataset(Dataset):
             
         for c in candidates:
             if c.is_absolute() and c.exists(): return c
-            if (Path.cwd() / c).exists(): return (Path.cwd() / c).resolve()
-            
-        # fallback search by filename
-        import glob
-        matches = glob.glob(f"**/{p.name}", recursive=True)
-        if matches: return Path(matches[0]).resolve()
-            
+            if c.exists(): return c.resolve()
         return None
 
     def __len__(self):
