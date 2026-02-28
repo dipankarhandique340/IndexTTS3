@@ -34,6 +34,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from indextts.s2mel.modules.commons import MyModel, load_checkpoint2
 from indextts.s2mel.modules.audio import mel_spectrogram
+from indextts.utils.maskgct_utils import build_semantic_codec
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 log = logging.getLogger(__name__)
@@ -288,19 +289,27 @@ def build_model(cfg_path, base_checkpoint, device):
                 except Exception:
                     log.warning("[Warning] Could not load CAMPPlus weights, using random init")
 
-    return model.to(device), campplus.to(device), cfg
+    # Load semantic codec for converting codes to embeddings
+    log.info("[Info] Loading semantic codec...")
+    semantic_codec = build_semantic_codec(cfg.semantic_codec)
+    semantic_codec = semantic_codec.to(device)
+    semantic_codec.eval()
+    log.info("[Info] Semantic codec loaded.")
+
+    return model.to(device), campplus.to(device), semantic_codec, cfg
 
 
 # ========================================================================
 # Training
 # ========================================================================
-def compute_loss(model, campplus, batch, device, semantic_codec=None):
+def compute_loss(model, campplus, semantic_codec, batch, device):
     """Compute S2Mel CFM loss.
 
-    Pipeline:
+    Pipeline (matches inference exactly):
     1. fbank → CAMPPlus → style (B, 192)
-    2. codes → reshape for length_regulator → cond (B, T_mel, 512)
-    3. cond + prompt_mel → CFM forward → loss
+    2. codes → semantic_codec.quantizer.vq2emb → float embeddings (B, T, 1024)
+    3. embeddings → length_regulator → cond (B, T_mel, 512)
+    4. cond + prompt_mel → CFM forward → loss
     """
     mel = batch["mel"].to(device)            # (B, 80, T_mel)
     mel_lens = batch["mel_lens"].to(device)  # (B,)
@@ -314,20 +323,22 @@ def compute_loss(model, campplus, batch, device, semantic_codec=None):
     with torch.no_grad():
         style = campplus(fbank)  # (B, 192)
 
-    # 2. Process codes through length_regulator to get cond
-    # The length_regulator expects codes as (B, n_codebooks, T) format
-    # and outputs (cond, _) where cond is (B, T_mel, 512)
-    target_lengths = mel_lens  # target mel lengths
-    codes_for_lr = codes.unsqueeze(1)  # (B, 1, T_codes)
+    # 2. Convert integer codes to float embeddings via semantic codec
+    # This matches inference: S_infer = semantic_codec.quantizer.vq2emb(codes.unsqueeze(1))
+    with torch.no_grad():
+        code_emb = semantic_codec.quantizer.vq2emb(codes.unsqueeze(1))  # (B, 1024, T)
+        code_emb = code_emb.transpose(1, 2)  # (B, T, 1024)
 
+    # 3. Process through length_regulator to get cond
+    target_lengths = mel_lens
     cond = model.models['length_regulator'](
-        codes_for_lr, ylens=target_lengths, n_quantizers=1, f0=None
+        code_emb, ylens=target_lengths, n_quantizers=1, f0=None
     )[0]  # (B, T_mel, 512)
 
-    # 3. Prompt: use first ~20% of mel as prompt
+    # 4. Prompt: use first ~20% of mel as prompt
     prompt_lens = (mel_lens.float() * 0.2).long().clamp(min=10)
 
-    # 4. CFM forward loss
+    # 5. CFM forward loss
     loss, _ = model.models['cfm'](mel, mel_lens, prompt_lens, cond, style)
     return loss
 
@@ -348,14 +359,14 @@ def save_ckpt(path, model, optimizer, scheduler, scaler, epoch, step, recent):
             old.unlink()
 
 
-def evaluate(model, campplus, loader, device):
+def evaluate(model, campplus, semantic_codec, loader, device):
     model.eval()
     total = n = 0
     with torch.no_grad():
         for batch in loader:
             if batch is None: continue
             try:
-                loss = compute_loss(model, campplus, batch, device)
+                loss = compute_loss(model, campplus, semantic_codec, batch, device)
                 total += loss.item(); n += 1
             except: continue
     model.train()
@@ -407,7 +418,7 @@ def main():
                             pin_memory=True)
 
     log.info("[Info] Building S2Mel model...")
-    model, campplus, full_cfg = build_model(args.config, args.base_checkpoint, device)
+    model, campplus, semantic_codec, full_cfg = build_model(args.config, args.base_checkpoint, device)
     campplus.eval()  # Style extractor is always in eval mode
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -451,7 +462,7 @@ def main():
             try:
                 use_amp = args.amp and device.type == "cuda"
                 with torch.amp.autocast("cuda", enabled=use_amp):
-                    loss = compute_loss(model, campplus, batch, device)
+                    loss = compute_loss(model, campplus, semantic_codec, batch, device)
                     loss = loss / args.grad_accumulation
 
                 if scaler: scaler.scale(loss).backward()
@@ -474,7 +485,7 @@ def main():
                         log.info(f"[Train] epoch={epoch} step={global_step} loss={al:.4f} lr={lr:.2e}")
 
                     if args.val_interval > 0 and global_step % args.val_interval == 0:
-                        vl = evaluate(model, campplus, val_loader, device)
+                        vl = evaluate(model, campplus, semantic_codec, val_loader, device)
                         log.info(f"[Val] step={global_step} loss={vl:.4f}")
                         save_ckpt(args.output_dir / f"model_step{global_step}.pth",
                                   model, optimizer, scheduler, scaler, epoch, global_step, recent)
@@ -498,7 +509,7 @@ def main():
                   model, optimizer, scheduler, scaler, epoch, global_step, [])
 
         if len(val_ds) > 0:
-            vl = evaluate(model, campplus, val_loader, device)
+            vl = evaluate(model, campplus, semantic_codec, val_loader, device)
             log.info(f"[Val] epoch={epoch} loss={vl:.4f}")
 
     log.info("Training complete.")
