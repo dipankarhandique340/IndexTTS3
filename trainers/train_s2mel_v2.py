@@ -551,12 +551,6 @@ def main():
         elapsed = time.time() - t0
         avg = ep_loss / max(ep_n, 1)
         log.info(f"[Epoch {epoch}/{args.epochs}] avg_loss={avg:.4f} time={elapsed:.0f}s")
-        save_ckpt(args.output_dir / "latest.pth",
-                  model, optimizer, scheduler, scaler, epoch, global_step, [])
-
-        if len(val_ds) > 0:
-            vl = evaluate(model, campplus, semantic_codec, val_loader, device)
-            log.info(f"[Val] epoch={epoch} loss={vl:.4f}")
 
     log.info("Training complete.")
 
