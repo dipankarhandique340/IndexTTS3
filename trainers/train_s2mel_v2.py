@@ -419,6 +419,7 @@ def main():
 
     log.info("[Info] Building S2Mel model...")
     model, campplus, semantic_codec, full_cfg = build_model(args.config, args.base_checkpoint, device)
+    model.models['cfm'].estimator.setup_caches(max_batch_size=args.batch_size, max_seq_length=8192)
     campplus.eval()  # Style extractor is always in eval mode
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
