@@ -50,7 +50,7 @@ cmd_args = parser.parse_args()
 # ---------------------------------------------------------------------------
 print_banner("IndexTTS2 CPU WebUI — Starting")
 
-download_checkpoints(cmd_args.model_dir)
+# download_checkpoints(cmd_args.model_dir)
 
 print_banner("Loading Models (this may take 1-2 minutes)")
 tts = IndexTTS2CPU(

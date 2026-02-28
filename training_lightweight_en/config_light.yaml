@@ -61,6 +61,7 @@ s2mel:
             fmin: 0
             fmax: "None"
 
+    gpt_dim: 768
     dit_type: "DiT"
     reg_loss_type: "l1"
     style_encoder:
